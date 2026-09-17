@@ -1,0 +1,377 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+import os, sys, re, datetime, tempfile, subprocess
+
+# 支援 PopClip (環境變數), 快速動作/終端 (參數), 或管線 (stdin)
+text = os.environ.get('POPCLIP_TEXT', '').strip()
+if not text:
+    if len(sys.argv) > 1:
+        text = ' '.join(sys.argv[1:]).strip()
+    else:
+        try:
+            text = sys.stdin.read().strip()
+        except Exception:
+            text = ''
+
+if not text:
+    sys.exit(0)
+
+now = datetime.datetime.now()
+raw_lines = [l.strip() for l in text.splitlines() if l.strip()]
+if not raw_lines:
+    sys.exit(0)
+def escape_ics(s):
+    return s.replace('\\', '\\\\').replace(';', '\\;').replace(',', '\\,').replace('\n', '\\n')
+
+def parse_single_or_block(block_text, lines, now):
+    target_line = ''
+    for l in lines:
+        if any(k in l for k in ['紐約', '美東', 'NY', 'New York', 'EDT', 'EST']):
+            target_line = l
+            break
+    if not target_line:
+        for l in lines:
+            if any(k in l for k in ['今天', '明天', '後天', '大後天', '禮拜', '星期', '週', '周']) or re.search(r'\d{1,2}[:：/月點時]', l):
+                target_line = l
+                break
+    if not target_line:
+        target_line = lines[0]
+
+    # --- 1. 跨日期解析 (M1/D1 - M2/D2 或 M/D1 - D2) ---
+    m_range_date = re.search(r'(?:(\d{4})[年/\-])?(\d{1,2})[月/\-](\d{1,2})[日號]?\s*[-~至到]\s*(?:(\d{4})[年/\-])?(\d{1,2})[月/\-](\d{1,2})[日號]?', target_line)
+    m_range_short = re.search(r'(?:(\d{4})[年/\-])?(\d{1,2})[月/](\d{1,2})[日號]?\s*[-~至到]\s*(\d{1,2})[日號]?', target_line)
+
+    is_date_range = False
+    start_date = None
+    end_date = None
+
+    if m_range_date:
+        y1, m1, d1, y2, m2, d2 = m_range_date.groups()
+        if 1 <= int(m1) <= 12 and 1 <= int(m2) <= 12 and 1 <= int(d1) <= 31 and 1 <= int(d2) <= 31:
+            year1 = int(y1) if y1 else now.year
+            year2 = int(y2) if y2 else year1
+            start_date = datetime.date(year1, int(m1), int(d1))
+            end_date = datetime.date(year2, int(m2), int(d2))
+            is_date_range = True
+
+    if not is_date_range and m_range_short:
+        y1, m1, d1, d2 = m_range_short.groups()
+        if 1 <= int(m1) <= 12 and 1 <= int(d1) <= 31 and 1 <= int(d2) <= 31:
+            year1 = int(y1) if y1 else now.year
+            start_date = datetime.date(year1, int(m1), int(d1))
+            end_date = datetime.date(year1, int(m1), int(d2))
+            is_date_range = True
+
+    # --- 2. 具體時間檢查 ---
+    has_time = False
+    is_pm = False
+    is_am = False
+    time_ampm_match = re.search(r'(早上|清晨|上午|中午|下午|傍晚|晚上|夜間)', target_line)
+    if time_ampm_match:
+        has_time = True
+        period = time_ampm_match.group(1)
+        if period in ['下午', '傍晚', '晚上', '夜間']:
+            is_pm = True
+        elif period in ['早上', '清晨', '上午']:
+            is_am = True
+
+    m_range_4digit = re.search(r'(\d{1,2})(\d{2})\s*[-~至到]\s*(\d{1,2})(\d{2})', target_line)
+    m_range_colon = re.search(r'(\d{1,2})[:：](\d{2})\s*[-~至到]\s*(\d{1,2})[:：](\d{2})', target_line)
+    m_single_colon = re.search(r'(\d{1,2})[:：](\d{2})', target_line)
+    m_zh_time = re.search(r'(\d{1,2})[點點時](\s*半|\s*\d{1,2}[分]?)?', target_line)
+    m_single_4digit = re.search(r'(?:^|[^\d])(\d{1,2})(\d{2})(?:[^\d]|$)', target_line)
+
+    start_h, start_m, end_h, end_m = None, 0, None, 0
+
+    if m_range_4digit:
+        has_time = True
+        start_h, start_m, end_h, end_m = map(int, m_range_4digit.groups())
+    elif m_range_colon:
+        has_time = True
+        start_h, start_m, end_h, end_m = map(int, m_range_colon.groups())
+    elif m_single_colon:
+        has_time = True
+        start_h, start_m = int(m_single_colon.group(1)), int(m_single_colon.group(2))
+    elif m_zh_time:
+        has_time = True
+        start_h = int(m_zh_time.group(1))
+        min_part = m_zh_time.group(2)
+        if min_part:
+            if '半' in min_part:
+                start_m = 30
+            else:
+                m_digits = re.search(r'\d+', min_part)
+                if m_digits:
+                    start_m = int(m_digits.group(0))
+    elif m_single_4digit and not is_date_range:
+        has_time = True
+        start_h, start_m = int(m_single_4digit.group(1)), int(m_single_4digit.group(2))
+
+    # --- 3. 整天行程判斷 ---
+    is_all_day = False
+    if is_date_range and not has_time:
+        is_all_day = True
+    elif not has_time:
+        single_date = None
+        if '今天' in target_line:
+            single_date = now.date()
+        elif '明天' in target_line:
+            single_date = (now + datetime.timedelta(days=1)).date()
+        elif '後天' in target_line:
+            single_date = (now + datetime.timedelta(days=2)).date()
+        elif '大後天' in target_line:
+            single_date = (now + datetime.timedelta(days=3)).date()
+        else:
+            m_sdate = re.search(r'(?:(\d{4})[年/\-])?(\d{1,2})[月/\-](\d{1,2})[日號]?', target_line)
+            if m_sdate:
+                y, m, d = m_sdate.groups()
+                if 1 <= int(m) <= 12 and 1 <= int(d) <= 31:
+                    single_date = datetime.date(int(y) if y else now.year, int(m), int(d))
+            else:
+                m_slash = re.search(r'(?:^|[^\d/])(\d{1,2})/(\d{1,2})(?:[^\d/]|$)', target_line)
+                if m_slash:
+                    m, d = map(int, m_slash.groups())
+                    if 1 <= m <= 12 and 1 <= d <= 31:
+                        single_date = datetime.date(now.year, m, d)
+        if single_date:
+            is_all_day = True
+            start_date = single_date
+            end_date = single_date
+
+    # --- 4. 具體時間日期點計算 ---
+    start_dt, end_dt = None, None
+    if not is_all_day:
+        target_date = None
+        if '今天' in target_line:
+            target_date = now.date()
+        elif '明天' in target_line:
+            target_date = (now + datetime.timedelta(days=1)).date()
+        elif '後天' in target_line:
+            target_date = (now + datetime.timedelta(days=2)).date()
+        elif '大後天' in target_line:
+            target_date = (now + datetime.timedelta(days=3)).date()
+        elif '昨天' in target_line:
+            target_date = (now - datetime.timedelta(days=1)).date()
+        else:
+            week_match = re.search(r'(?:(下|這)?[個週周禮拜星期]+([一二三四五六日天\d]))', target_line)
+            if week_match:
+                prefix, w_day = week_match.groups()
+                day_map = {'一':0, '二':1, '三':2, '四':3, '五':4, '六':5, '日':6, '天':6, '1':0, '2':1, '3':2, '4':3, '5':4, '6':5, '7':6}
+                target_weekday = day_map.get(w_day)
+                if target_weekday is not None:
+                    current_weekday = now.weekday()
+                    days_ahead = (target_weekday - current_weekday) % 7
+                    if prefix == '下' or days_ahead == 0:
+                        days_ahead += 7
+                    target_date = (now + datetime.timedelta(days=days_ahead)).date()
+            else:
+                m_full = re.search(r'(\d{4})[年/\-](\d{1,2})[月/\-](\d{1,2})[日號]?', target_line)
+                if m_full:
+                    y, m, d = map(int, m_full.groups())
+                    target_date = datetime.date(y, m, d)
+                else:
+                    m_zh = re.search(r'(\d{1,2})月(\d{1,2})[日號]?', target_line)
+                    if m_zh:
+                        m, d = map(int, m_zh.groups())
+                        target_date = datetime.date(now.year, m, d)
+                    else:
+                        m_slash = re.search(r'(?:^|[^\d/])(\d{1,2})/(\d{1,2})(?:[^\d/]|$)', target_line)
+                        if m_slash:
+                            m, d = map(int, m_slash.groups())
+                            if 1 <= m <= 12 and 1 <= d <= 31:
+                                target_date = datetime.date(now.year, m, d)
+
+        if not target_date:
+            target_date = now.date()
+
+        if start_h is None:
+            start_h = (now.hour + 1) % 24
+            start_m = 0
+
+        if is_pm and start_h < 12:
+            start_h += 12
+        elif is_am and start_h == 12:
+            start_h = 0
+        if end_h is not None and is_pm and end_h < 12:
+            end_h += 12
+
+        start_dt = datetime.datetime(target_date.year, target_date.month, target_date.day, start_h, start_m)
+        if end_h is not None:
+            end_dt = datetime.datetime(target_date.year, target_date.month, target_date.day, end_h, end_m)
+        else:
+            end_dt = start_dt + datetime.timedelta(hours=1)
+
+    # --- 5. 提取活動標題（智慧優化） ---
+    title = ''
+    # 5.1 優先檢查前三行是否有【...】、[...]、「...」等明確標題符號
+    for l in lines[:3]:
+        m_bracket = re.search(r'[【\[「『](.*?)[】\]」』]', l)
+        if m_bracket and len(m_bracket.group(1).strip()) >= 2:
+            title = m_bracket.group(1).strip()
+            break
+
+    # 5.2 若無括號，且第一行不是會議時間/日程標籤，且沒有明確時分點（如 20:00）
+    if not title and len(lines) > 1:
+        first = lines[0]
+        if not any(k in first for k in ['時間', '會議時間', '通知', '如下', '日程', '地點']) and not re.search(r'\d{1,2}[:：]\d{2}', first):
+            first_clean = re.sub(r'^[【\[「『\*\-•#\s]+|[】\]」』\s]+$', '', first)
+            if len(first_clean) >= 2:
+                title = first_clean
+
+    # 5.3 單行輸入或備用方案：從包含時間的目標行去除時間詞
+    if not title:
+        title = target_line
+        remove_patterns = [
+            r'(?:(\d{4})[年/\-])?(\d{1,2})[月/\-](\d{1,2})[日號]?\s*[-~至到]\s*(?:(\d{4})[年/\-])?(\d{1,2})[月/\-](\d{1,2})[日號]?',
+            r'(?:(\d{4})[年/\-])?(\d{1,2})[月/](\d{1,2})[日號]?\s*[-~至到]\s*(\d{1,2})[日號]?',
+            r'\d{3,4}\s*[-~至到]\s*\d{3,4}',
+            r'\d{1,2}[:：]\d{2}\s*[-~至到]\s*\d{1,2}[:：]\d{2}',
+            r'\d{1,2}[:：]\d{2}',
+            r'\d{1,2}[點點時](\s*半|\s*\d{1,2}[分]?)?',
+            r'(今天|明天|後天|大後天|昨天)',
+            r'(下|這)?[個週周禮拜星期]+[一二三四五六日天\d]',
+            r'(\d{4})[年/\-](\d{1,2})[月/\-](\d{1,2})[日號]?',
+            r'(\d{1,2})月(\d{1,2})[日號]?',
+            r'(?:^|[^\d/])(\d{1,2})/(\d{1,2})(?:[^\d/]|$)',
+            r'(早上|清晨|上午|中午|下午|傍晚|晚上|夜間)',
+            r'[(（][一二三四五六日天][)）]',
+            r'\d{3,4}',
+            r'^[【\[「『\*\-•#\s]+|[】\]」』\s]+$',
+            r'[。！!\s]+$'
+        ]
+        for p in remove_patterns:
+            title = re.sub(p, ' ', title)
+        title = ' '.join(title.split()).strip()
+        if not title:
+            title = lines[0]
+
+    return {
+        'title': title,
+        'is_all_day': is_all_day,
+        'start_date': start_date,
+        'end_date': end_date,
+        'start_dt': start_dt,
+        'end_dt': end_dt,
+        'desc': block_text
+    }
+
+# --- 判斷批次 (Batch) 還是單一多時區通知 ---
+has_tz_markers = sum(1 for l in raw_lines if any(k in l for k in ['紐約', '美東', '台灣', '台北', 'P島', 'UTC', 'GMT'])) >= 2
+has_meeting_header = any('會議時間' in l or '時間：' in l or '時間:' in l for l in raw_lines)
+
+events = []
+if has_tz_markers or has_meeting_header or len(raw_lines) == 1:
+    ev = parse_single_or_block(text, raw_lines, now)
+    if ev:
+        events.append(ev)
+else:
+    for l in raw_lines:
+        ev = parse_single_or_block(l, [l], now)
+        if ev and ev['title']:
+            events.append(ev)
+    if not events:
+        ev = parse_single_or_block(text, raw_lines, now)
+        if ev:
+            events.append(ev)
+
+if not events:
+    sys.exit(0)
+
+# --- 6. 執行加入日曆 ---
+if len(events) == 1:
+    ev = events[0]
+    clean_title = escape_ics(ev['title'])
+    clean_desc = escape_ics(ev['desc'])
+    ics_parts = ['BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//PopClip Calendar//TW', 'BEGIN:VEVENT', f'SUMMARY:{clean_title}']
+    if ev['is_all_day']:
+        s_val = ev['start_date'].strftime('%Y%m%d')
+        e_val = (ev['end_date'] + datetime.timedelta(days=1)).strftime('%Y%m%d')
+        ics_parts.append(f'DTSTART;VALUE=DATE:{s_val}')
+        ics_parts.append(f'DTEND;VALUE=DATE:{e_val}')
+    else:
+        s_val = ev['start_dt'].strftime('%Y%m%dT%H%M%S')
+        e_val = ev['end_dt'].strftime('%Y%m%dT%H%M%S')
+        ics_parts.append(f'DTSTART:{s_val}')
+        ics_parts.append(f'DTEND:{e_val}')
+    ics_parts.append(f'DESCRIPTION:{clean_desc}')
+    ics_parts.append('END:VEVENT')
+    ics_parts.append('END:VCALENDAR')
+
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.ics', delete=False, encoding='utf-8') as f:
+        f.write('\n'.join(ics_parts))
+        temp_path = f.name
+    subprocess.run(['open', temp_path])
+
+else:
+    lines_preview = []
+    for i, ev in enumerate(events):
+        if ev['is_all_day']:
+            if ev['start_date'] == ev['end_date']:
+                d_str = ev['start_date'].strftime('%Y/%m/%d') + ' (整天)'
+            else:
+                d_str = ev['start_date'].strftime('%Y/%m/%d') + ' ~ ' + ev['end_date'].strftime('%Y/%m/%d') + ' (整天)'
+        else:
+            d_str = ev['start_dt'].strftime('%Y/%m/%d %H:%M') + ' ~ ' + ev['end_dt'].strftime('%H:%M')
+        lines_preview.append(f"{i+1}. {ev['title']}：{d_str}")
+
+    preview_msg = f"辨識出以下 {len(events)} 筆行程：\n\n" + '\n'.join(lines_preview) + "\n\n是否確認全部加入 Apple 日曆？"
+    clean_preview = preview_msg.replace('"', '\\"')
+
+    dialog_as = f'''display dialog "{clean_preview}" with title "PopClip 批次行程匯入確認" buttons {{"取消", "確認全部加入"}} default button "確認全部加入" cancel button "取消"'''
+    res = subprocess.run(['osascript', '-e', dialog_as])
+    if res.returncode != 0:
+        sys.exit(0)
+
+    as_lines = [
+        'tell application "Calendar"',
+        'set targetCal to item 1 of (every calendar)',
+        'tell targetCal'
+    ]
+    for ev in events:
+        clean_t = ev['title'].replace('"', '\\"')
+        clean_d = ev['desc'].replace('"', '\\"')
+        if ev['is_all_day']:
+            sy, sm, sd = ev['start_date'].year, ev['start_date'].month, ev['start_date'].day
+            ey, em, ed = ev['end_date'].year, ev['end_date'].month, ev['end_date'].day
+            as_lines.append(f'''
+                set sDate to current date
+                set year of sDate to {sy}
+                set month of sDate to {sm}
+                set day of sDate to {sd}
+                set hours of sDate to 0
+                set minutes of sDate to 0
+                set seconds of sDate to 0
+                set eDate to current date
+                set year of eDate to {ey}
+                set month of eDate to {em}
+                set day of eDate to {ed}
+                set hours of eDate to 23
+                set minutes of eDate to 59
+                set seconds of eDate to 59
+                make new event with properties {{summary:"{clean_t}", start date:sDate, end date:eDate, allday event:true, description:"{clean_d}"}}
+            ''')
+        else:
+            sy, sm, sd, sh, smin = ev['start_dt'].year, ev['start_dt'].month, ev['start_dt'].day, ev['start_dt'].hour, ev['start_dt'].minute
+            ey, em, ed, eh, emin = ev['end_dt'].year, ev['end_dt'].month, ev['end_dt'].day, ev['end_dt'].hour, ev['end_dt'].minute
+            as_lines.append(f'''
+                set sDate to current date
+                set year of sDate to {sy}
+                set month of sDate to {sm}
+                set day of sDate to {sd}
+                set hours of sDate to {sh}
+                set minutes of sDate to {smin}
+                set seconds of sDate to 0
+                set eDate to current date
+                set year of eDate to {ey}
+                set month of eDate to {em}
+                set day of eDate to {ed}
+                set hours of eDate to {eh}
+                set minutes of eDate to {emin}
+                set seconds of eDate to 0
+                make new event with properties {{summary:"{clean_t}", start date:sDate, end date:eDate, allday event:false, description:"{clean_d}"}}
+            ''')
+    as_lines.append('end tell')
+    as_lines.append('end tell')
+    as_lines.append(f'display notification "已成功加入 {len(events)} 筆行程！" with title "Apple 行事曆"')
+
+    subprocess.run(['osascript', '-e', '\n'.join(as_lines)])

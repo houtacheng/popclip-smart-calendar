@@ -1,0 +1,4 @@
+name: 智能日曆助手
+icon: symbol:calendar.badge.plus
+description: 一鍵智能解析會議通知、跨時區、相對日期及批次行程，加入 Apple 日曆
+shellScriptFile: run.sh
